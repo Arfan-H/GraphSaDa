@@ -139,6 +139,32 @@ def pdf_dir(args):
     return Path(args.out) / "pdf"
 
 
+def read_jsonl(path):
+    """Baca JSONL; baris terakhir yang terpotong (proses dihentikan paksa) dilewati."""
+    if not path.exists():
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+
+def append_jsonl(path):
+    """Buka JSONL untuk ditambah; jika baris terakhir terpotong, mulai di baris baru."""
+    needs_nl = False
+    if path.exists() and path.stat().st_size:
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            needs_nl = f.read(1) != b"\n"
+    f = open(path, "a", encoding="utf-8")
+    if needs_nl:
+        f.write("\n")
+    return f
+
+
 def read_log(path):
     """download_log.csv append-only; baris terakhir per work yang berlaku."""
     last = {}
@@ -165,19 +191,14 @@ def oa_urls(rec):
 
 def resolve_openalex(args, work_ids, raw_path):
     """Ambil info OA untuk work_ids yang belum ada di raw_path (resumable)."""
-    done = set()
-    if raw_path.exists():
-        with open(raw_path, encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    done.add(short_id(json.loads(line).get("id")))
+    done = {short_id(rec.get("id")) for rec in read_jsonl(raw_path)}
     todo = [w for w in work_ids if w not in done]
     log(f"OpenAlex: {len(work_ids):,} works, {len(done & set(work_ids)):,} sudah di-resolve, "
         f"{len(todo):,} perlu query (~{-(-len(todo) // MAX_OR_VALUES):,} request)")
     if not todo:
         return
     client = make_client(args)
-    with open(raw_path, "a", encoding="utf-8") as out:
+    with append_jsonl(raw_path) as out:
         for i, batch in enumerate(chunks(todo, MAX_OR_VALUES), 1):
             data = client.get("/works", {
                 "filter": "openalex:" + "|".join(batch),
@@ -218,12 +239,7 @@ def cmd_resolve(args):
                  if (only is None or w["work_id"] in only) and keep(w.get("year"))]
         raw_path = out_dir / "raw" / "oa_locations.jsonl"
         resolve_openalex(args, [w["work_id"] for w in works], raw_path)
-        oa_info = {}
-        with open(raw_path, encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    rec = json.loads(line)
-                    oa_info[short_id(rec.get("id"))] = rec
+        oa_info = {short_id(rec.get("id")): rec for rec in read_jsonl(raw_path)}
         for w in works:
             rec = oa_info.get(w["work_id"]) or {}
             oa = rec.get("open_access") or {}
@@ -620,7 +636,7 @@ def cmd_download(args):
     stats = Counter()
     total_bytes = 0
     t0 = time.time()
-    metaf = open(meta_path, "a", encoding="utf-8")
+    metaf = append_jsonl(meta_path)
     pool = ThreadPoolExecutor(max_workers=args.workers)
     pending = set()
     it = iter(todo)
@@ -764,14 +780,8 @@ def cmd_extract(args):
     if not args.no_fulltext:
         text_dir.mkdir(parents=True, exist_ok=True)
     log_rows = read_log(out_dir / "download_log.csv")
-    landing = {}
-    meta_path = out_dir / "landing_meta.jsonl"
-    if meta_path.exists():
-        with open(meta_path, encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    rec = json.loads(line)
-                    landing[rec["work_id"]] = rec.get("meta") or {}
+    landing = {rec["work_id"]: rec.get("meta") or {}
+               for rec in read_jsonl(out_dir / "landing_meta.jsonl")}
 
     ok_ids = [w for w, r in log_rows.items() if r["status"] == "ok"]
     ids = uniq(ok_ids + list(landing))
